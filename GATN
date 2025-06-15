@@ -1,0 +1,185 @@
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.distributions import Normal, kl_divergence
+import gym
+
+class VAE(nn.Module):
+    def __init__(self, input_dim, latent_dim):
+        super(VAE, self).__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 2 * latent_dim)  # Mean and log variance
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 128),
+            nn.ReLU(),
+            nn.Linear(128, input_dim)
+        )
+        self.latent_dim = latent_dim
+
+    def encode(self, x):
+        h = self.encoder(x)
+        mu, logvar = h[:, :self.latent_dim], h[:, self.latent_dim:]
+        return mu, logvar
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def decode(self, z):
+        return self.decoder(z)
+
+    def forward(self, x):
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar)
+        x_recon = self.decode(z)
+        return x_recon, mu, logvar
+
+class PolicyAdapter(nn.Module):
+    def __init__(self, latent_dim, num_source_tasks, action_dim):
+        super(PolicyAdapter, self).__init__()
+        self.gate = nn.Sequential(
+            nn.Linear(latent_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, num_source_tasks + 1)
+        )
+        self.combiner = nn.Sequential(
+            nn.Linear(latent_dim + action_dim * (num_source_tasks + 1), 128),
+            nn.ReLU(),
+            nn.Linear(128, action_dim)
+        )
+
+    def forward(self, z, source_outputs, base_output):
+        gate_scores = self.gate(z)
+        weights = torch.softmax(gate_scores, dim=-1)
+        combined_input = torch.cat([z] + source_outputs + [base_output], dim=-1)
+        return self.combiner(combined_input), weights
+
+class BaseNetwork(nn.Module):
+    def __init__(self, input_dim, action_dim):
+        super(BaseNetwork, self).__init__()
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, action_dim)
+        )
+
+    def forward(self, x):
+        return self.network(x)
+
+class Scheduler(nn.Module):
+    def __init__(self, latent_dim, num_source_tasks):
+        super(Scheduler, self).__init__()
+        self.network = nn.Sequential(
+            nn.Linear(latent_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, num_source_tasks),
+            nn.Softmax(dim=-1)
+        )
+
+    def forward(self, z):
+        return self.network(z)
+
+class GATN:
+    def __init__(self, env, source_tasks, latent_dim=64, M=2, lr=0.0005, lr_base=0.0025):
+        self.env = env
+        self.source_tasks = source_tasks
+        self.num_source_tasks = len(source_tasks)
+        self.M = M
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        self.state_dim = env.observation_space.shape[0]
+        self.action_dim = env.action_space.n if hasattr(env.action_space, 'n') else env.action_space.shape[0]
+
+        self.vae = VAE(self.state_dim, latent_dim).to(self.device)
+        self.policy_adapter = PolicyAdapter(latent_dim, self.num_source_tasks, self.action_dim).to(self.device)
+        self.base_network = BaseNetwork(self.state_dim, self.action_dim).to(self.device)
+        self.scheduler = Scheduler(latent_dim, self.num_source_tasks).to(self.device)
+
+        self.optimizer_vae = optim.Adam(self.vae.parameters(), lr=lr)
+        self.optimizer_adapter = optim.Adam(self.policy_adapter.parameters(), lr=lr)
+        self.optimizer_base = optim.Adam(self.base_network.parameters(), lr=lr_base)
+        self.optimizer_sched = optim.Adam(self.scheduler.parameters(), lr=lr)
+
+    def compute_vae_loss(self, x, x_recon, mu, logvar):
+        recon_loss = nn.MSELoss()(x_recon, x)
+        kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+        return recon_loss + kl_loss
+
+    def compute_robustness_loss(self, s, action_output, epsilon=0.1):
+        noise = torch.normal(0, epsilon, size=s.shape).to(self.device)
+        s_perturbed = s + noise
+        _, mu_perturbed, _ = self.vae(s_perturbed)
+        perturbed_output, _ = self.policy_adapter(mu_perturbed, [], self.base_network(s_perturbed))
+        return nn.MSELoss()(perturbed_output, action_output)
+
+    def select_source_tasks(self, z):
+        scores = self.scheduler(z)
+        probs = scores.cpu().detach().numpy()
+        indices = np.random.choice(self.num_source_tasks, size=self.M, p=probs)
+        return indices
+
+    def train_episode(self, gamma=0.99):
+        state = self.env.reset()
+        state = torch.FloatTensor(state).to(self.device)
+        total_reward = 0
+
+        done = False
+        while not done:
+            x_recon, mu, logvar = self.vae(state)
+            vae_loss = self.compute_vae_loss(state, x_recon, mu, logvar)
+
+            selected_tasks = self.select_source_tasks(mu)
+            source_outputs = [torch.FloatTensor(self.source_tasks[i](state.cpu().numpy())).to(self.device)
+                            for i in selected_tasks]
+
+            base_output = self.base_network(state)
+            action_output, weights = self.policy_adapter(mu, source_outputs, base_output)
+
+            action = torch.argmax(action_output, dim=-1).cpu().numpy()
+            next_state, reward, done, _ = self.env.step(action)
+            next_state = torch.FloatTensor(next_state).to(self.device)
+            total_reward += reward
+
+            td_target = reward + gamma * torch.max(self.base_network(next_state)).detach()
+            td_error = nn.MSELoss()(action_output, td_target)
+
+            robustness_loss = self.compute_robustness_loss(state, action_output)
+
+            total_loss = td_error + vae_loss + robustness_loss
+            self.optimizer_vae.zero_grad()
+            self.optimizer_adapter.zero_grad()
+            self.optimizer_base.zero_grad()
+            self.optimizer_sched.zero_grad()
+            total_loss.backward()
+            self.optimizer_vae.step()
+            self.optimizer_adapter.step()
+            self.optimizer_base.step()
+            self.optimizer_sched.step()
+
+            state = next_state
+
+        return total_reward
+
+def main():
+    env = gym.make("Pong-v4")
+    source_tasks = [lambda s: np.random.rand(3) for _ in range(3)]  # Dummy source policies
+    gatn = GATN(env, source_tasks)
+    
+    for episode in range(1000):
+        reward = gatn.train_episode()
+        if episode % 100 == 0:
+            print(f"Episode {episode}, Reward: {reward}")
+
+if __name__ == "__main__":
+    main()
